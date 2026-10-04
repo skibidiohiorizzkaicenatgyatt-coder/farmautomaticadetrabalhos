@@ -1,0 +1,30 @@
+# Chave da API (nunca subir)
+.env
+.env.*
+!.env.example
+ 
+# Ambiente virtual
+venv/
+.venv/
+env/
+ 
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+ 
+# Arquivos do projeto (documentos pessoais e resultados)
+entrada/
+saida/
+ 
+# Arquivos temporários do Office
+~$*
+*.tmp
+ 
+# Editores e sistema
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+ 
