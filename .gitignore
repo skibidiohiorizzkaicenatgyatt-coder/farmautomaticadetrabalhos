@@ -17,6 +17,7 @@ __pycache__/
 # Arquivos do projeto (documentos pessoais e resultados)
 entrada/
 saida/
+.cache_ocr/
  
 # Arquivos temporários do Office
 ~$*

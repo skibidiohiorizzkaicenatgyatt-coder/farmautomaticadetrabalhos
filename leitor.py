@@ -1,14 +1,33 @@
 import shutil
 from pathlib import Path
 
-LIMITE_POR_ARQUIVO = 25000   # caracteres por arquivo
-LIMITE_TOTAL = 60000         # caracteres de modelos + fontes (~15 mil tokens)
+import visao
+
+LIMITE_POR_ARQUIVO = 25000   # instruções e modelos: caracteres por arquivo
+LIMITE_MODELOS = 30000       # modelos: caracteres no total
+LIMITE_TOTAL = 60000         # modelos + trechos das fontes que vão para a IA
+LIMITE_LEITURA = 2_000_000   # fontes: caracteres lidos por arquivo (segurança)
 PAPEIS = ["instrucoes", "modelos", "fontes"]
 
 
 def _ler_pdf(caminho):
+    """Texto do PDF, página por página. Páginas sem texto (escaneadas) são lidas pelo Claude."""
     from pypdf import PdfReader
-    return "\n".join((p.extract_text() or "") for p in PdfReader(caminho).pages)
+    nome = Path(caminho).name
+    paginas = [(p.extract_text() or "").strip() for p in PdfReader(str(caminho)).pages]
+    vazias = [i for i, t in enumerate(paginas, 1) if len(t) < 30]
+    if vazias and visao.OCR_ATIVO:
+        alvo = vazias[:visao.MAX_PAGINAS_OCR]
+        if len(vazias) > len(alvo):
+            print(f"   AVISO: {len(vazias)} páginas sem texto em {nome}; lendo só as {len(alvo)} primeiras "
+                  "(MAX_PAGINAS_OCR no visao.py)", flush=True)
+        print(f"   lendo {len(alvo)} página(s) escaneada(s) de {nome} com o Claude...", flush=True)
+        try:
+            for n, t in visao.transcrever_paginas_pdf(caminho, alvo).items():
+                paginas[n - 1] = "" if t.strip() == "[sem texto legível]" else t
+        except Exception as e:
+            print(f"   AVISO: não consegui ler as páginas escaneadas ({type(e).__name__}: {e})", flush=True)
+    return "\n".join(f"[p. {i}]\n{t}" for i, t in enumerate(paginas, 1) if t)
 
 def _ler_docx(caminho):
     from docx import Document
@@ -45,15 +64,24 @@ def _ler_pptx(caminho):
 def _ler_texto(caminho):
     return Path(caminho).read_text(encoding="utf-8", errors="ignore")
 
+def _ler_imagem(caminho):
+    if not visao.OCR_ATIVO:
+        raise RuntimeError("leitura de imagens desativada (OCR_ATIVO no visao.py)")
+    print(f"   lendo a imagem {Path(caminho).name} com o Claude...", flush=True)
+    return visao.transcrever_imagem(caminho)
+
 LEITORES = {
     ".pdf": _ler_pdf, ".docx": _ler_docx, ".xlsx": _ler_xlsx, ".pptx": _ler_pptx,
     ".txt": _ler_texto, ".md": _ler_texto, ".csv": _ler_texto,
+    ".png": _ler_imagem, ".jpg": _ler_imagem, ".jpeg": _ler_imagem,
+    ".webp": _ler_imagem, ".gif": _ler_imagem,
 }
 
 
 def ler_entrada(pasta="entrada"):
     """Lê entrada/instrucoes, entrada/modelos e entrada/fontes (cria se não existirem).
-    Retorna (instrucoes, modelos, fontes), três textos."""
+    Retorna (instrucoes, modelos, docs): dois textos e a lista de fontes [{'nome', 'texto'}].
+    As fontes NÃO são cortadas aqui: se forem grandes, os trechos relevantes são escolhidos depois."""
     raiz = Path(pasta)
     for papel in PAPEIS:
         (raiz / papel).mkdir(parents=True, exist_ok=True)
@@ -62,8 +90,8 @@ def ler_entrada(pasta="entrada"):
     if soltos:
         print(f"   AVISO: arquivos soltos em '{pasta}' são ignorados, coloque nas subpastas: {', '.join(soltos)}", flush=True)
 
-    total, textos = 0, {}
-    for papel in PAPEIS:  # instruções primeiro, fontes por último (são as primeiras a serem cortadas)
+    textos, docs, total_modelos = {"instrucoes": "", "modelos": ""}, [], 0
+    for papel in PAPEIS:
         blocos = []
         for arq in sorted((raiz / papel).iterdir()):
             if not arq.is_file() or arq.name.startswith("~$"):
@@ -75,25 +103,34 @@ def ler_entrada(pasta="entrada"):
             try:
                 texto = leitor(arq).strip()
             except Exception as e:
-                print(f"   (não consegui ler {papel}/{arq.name}: {type(e).__name__})", flush=True)
+                print(f"   (não consegui ler {papel}/{arq.name}: {type(e).__name__}: {e})", flush=True)
                 continue
             if not texto:
-                print(f"   (sem texto extraível, talvez PDF escaneado: {papel}/{arq.name})", flush=True)
+                print(f"   (sem texto extraível: {papel}/{arq.name})", flush=True)
                 continue
+
+            if papel == "fontes":
+                if len(texto) > LIMITE_LEITURA:
+                    texto = texto[:LIMITE_LEITURA]
+                    print(f"   (arquivo enorme, só os primeiros {LIMITE_LEITURA} caracteres foram lidos: {arq.name})", flush=True)
+                docs.append({"nome": arq.name, "texto": texto})
+                print(f"   lido: fontes/{arq.name} ({len(texto)} caracteres)", flush=True)
+                continue
+
             if len(texto) > LIMITE_POR_ARQUIVO:
                 texto = texto[:LIMITE_POR_ARQUIVO] + "\n[... arquivo cortado por tamanho ...]"
                 print(f"   (cortado em {LIMITE_POR_ARQUIVO} caracteres: {papel}/{arq.name})", flush=True)
-            if papel != "instrucoes":
-                if total + len(texto) > LIMITE_TOTAL:
-                    print(f"   (limite total atingido, ignorado: {papel}/{arq.name})", flush=True)
+            if papel == "modelos":
+                if total_modelos + len(texto) > LIMITE_MODELOS:
+                    print(f"   (limite de modelos atingido, ignorado: {arq.name})", flush=True)
                     continue
-                total += len(texto)
+                total_modelos += len(texto)
             blocos.append(f"=== {arq.name} ===\n{texto}")
             print(f"   lido: {papel}/{arq.name} ({len(texto)} caracteres)", flush=True)
-        textos[papel] = "\n\n".join(blocos)
+        if papel != "fontes":
+            textos[papel] = "\n\n".join(blocos)
 
-    print(f"   total aproximado (modelos + fontes): {total // 4} tokens de entrada por chamada", flush=True)
-    return textos["instrucoes"], textos["modelos"], textos["fontes"]
+    return textos["instrucoes"], textos["modelos"], docs
 
 
 def arquivar_entrada(pasta_entrada, destino):
